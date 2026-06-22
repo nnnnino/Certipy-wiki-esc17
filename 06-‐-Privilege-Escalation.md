@@ -1,4 +1,4 @@
-Misconfigurations in AD CS can allow a low-privileged user to escalate privileges in Active Directory, often up to Domain Admin. The SpecterOps research introduced the "ESC" numbering to classify these **AD CS abuse scenarios**. Here we cover **ESC1 through ESC16** (as of 2025, 16 distinct escalation techniques have been identified). Each subsection explains the issue, technical details, how Certipy can detect or exploit it, examples of exploitation, and ways to mitigate that specific issue. Some attacks require multiple conditions or a chain of steps; Certipy's `find` output often flags the individual pieces, which an attacker can then exploit in sequence.
+Misconfigurations in AD CS can allow a low-privileged user to escalate privileges in Active Directory, often up to Domain Admin. The SpecterOps research introduced the "ESC" numbering to classify these **AD CS abuse scenarios**. Here we cover **ESC1 through ESC17** (as of 2026, 17 distinct escalation techniques have been identified). Each subsection explains the issue, technical details, how Certipy can detect or exploit it, examples of exploitation, and ways to mitigate that specific issue. Some attacks require multiple conditions or a chain of steps; Certipy's `find` output often flags the individual pieces, which an attacker can then exploit in sequence.
 
 ---
 
@@ -3040,3 +3040,142 @@ Misconfigurations in AD CS can allow a low-privileged user to escalate privilege
     * **Enable Full Strong Certificate Binding Enforcement on DCs:** Configure Domain Controllers to use `StrongCertificateBindingEnforcement = 2` (Full Enforcement Mode). See Microsoft KB5014754 for details. This mode is critical as it requires the SID extension (or a valid SAN SID URL in specific scenarios) for certificate mapping, mitigating UPN-based manipulation when the SID extension is simply missing. Microsoft's timeline indicated this would become the default for new domains from February 2025, with enforcement for existing domains planned for September 2025.
 
 ---
+
+## **ESC17 Enrollee-Supplied Subject for Server Authentication**
+
+1. **Description**
+
+    ESC17 is similar to ESC1 but targets templates that allow "Server Authentication". The outcome of an exploitation depends on further prerequisites in the targeted domain (see below). The vulnerability arises when a certificate template is inadequately secured, permitting a low-privileged user to request a certificate and, importantly, specify an arbitrary identity within the certificate's SAN. This allows the attacker to impersonate any server, including administrative ones such as WSUS.
+    The combination of these specific weak settings on a single certificate template creates the ESC17 vulnerability:
+
+    * **Enrollee Supplies Subject:** The template has the `CT_FLAG_ENROLLEE_SUPPLIES_SUBJECT` flag enabled. In the Certificate Template console, this is the "Supply in the request" option under the "Subject Name" tab. When enabled, the requester - not Active Directory - provides the subject information for the certificate. This is the core setting that allows an attacker to inject a victim's identity (e.g., UPN or DNS name) into the SAN.
+    * **Server Authentication EKU:** The template includes an EKU that permits server authentication. Common EKUs that enable this are "Server Authentication" (OID `1.3.6.1.5.5.7.3.1`), the overly permissive "Any Purpose" (OID `2.5.29.37.0`) or no specified EKU at all (which implies any purpose). A certificate with such an EKU can be used for the server component in a TLS-encrypted communication (e.g., an HTTPS server).
+    * **Permissive Enrollment Rights:** Low-privileged users or broad groups like "Domain Users" or "Authenticated Users" are granted "Enroll" permissions on the template's security settings. This defines who can request certificates from this template.
+    * **No Effective Security Gates:** The template does not enforce manager approval (the "CA certificate manager approval" option in "Issuance Requirements") nor requires authorized signatures (also known as enrollment agent signatures). The absence of these controls means qualifying requests are automatically processed and certificates issued without additional review.
+
+    When these conditions are all met, any user with enrollment rights can submit a CSR for this template. In the CSR, they can specify an arbitrary DNS name in the SAN (e.g., `wsus.corp.local`). The CA, trusting the template's insecure configuration, issues a certificate that appears to belong to the specified DNS name. The attacker can then use this certificate to impersonate a legitimate server, e.g., the internal WSUS server used for distribution of Windows updates. Depending on the specific service, an attacker could learn (plaintext) passwords for privileged accounts, gain access to NTLM hashes (e.g., for relaying) or even abuse the privileges of the service. When ESC17 was first identified, it was used in combination with the WSUS service to achieve code execution on targeted Windows systems.
+
+    This misconfiguration often occurs when administrators directly use or clone templates like "WebServer" or "SubCA", which already have "Supply in request" enabled by default. In ESC1 scenarios, this setting may often be an oversight and an undesired misconfiguration. In contrast, templates vulnerable against ESC17 are likely used for some kind of server authentication (e.g., securing an internal web application) and therefore use the combination of "Server Authentication" and "Supply in request" deliberately.
+
+2. **Identification with Certipy**
+
+   A full ESC17 attack chain does not rely solely on identifying a vulnerable template. One also needs some way to make use of a certificate by finding a desirable service (see "Exploitation" section for details).
+
+   The first part, identification of a vulnerable template, can be achieved by using Certipy's `find` command in a very similar fashion to the way that ESC1 works.
+   Certipy will specifically check for templates where the "Enrollee Supplies Subject" option is enabled, an EKU suitable for sever authentication is present, manager approval and authorized signatures are not required, and it lists the principals (users/groups) that have enrollment rights. The `[+] User Enrollable Principals` field in the output for a template will indicate if the current user context running Certipy has enrollment rights, and through which group membership these rights are granted.
+
+    **Expected Output Snippet:**
+
+    Within the "Certificate Templates" section of the `certipy find` output, vulnerable templates are clearly marked, with "ESC17" listed under the`[!] Vulnerabilities` heading.
+
+    ```text
+    Certificate Authorities
+      0
+        CA Name                             : CORP-CA
+        DNS Name                            : CA.CORP.LOCAL
+    ...
+    Certificate Templates
+      0
+        Template Name                       : VulnTemplate
+        Display Name                        : VulnTemplate
+        Certificate Authorities             : CORP-CA
+        Enabled                             : True
+        ...
+        Enrollee Supplies Subject           : True
+        Certificate Name Flag               : EnrolleeSuppliesSubject
+        ...
+        Extended Key Usage                  : Server Authentication
+        Requires Manager Approval           : False
+        ...
+        Authorized Signatures Required      : 0
+        ...
+        Permissions
+          Enrollment Permissions
+            Enrollment Rights               : CORP.LOCAL\Domain Users
+        ...
+        [+] User Enrollable Principals      : CORP.LOCAL\Domain Users
+        [!] Vulnerabilities
+          ESC17                             : Enrollee supplies subject and template allows server authentication.
+        [*] Remarks
+          ESC17                              : Other prerequisites may be required for this to be exploitable. See the wiki for more details.
+    ```
+
+    **Key indicators to look for in the output for a specific template:**
+
+    * `[!] Vulnerabilities ESC17 : Enrollee supplies subject and template allows server authentication.` This explicitly flags the vulnerability.
+    * `Enrollee Supplies Subject : True` This confirms the setting allowing attacker-defined subjects.
+    * `Extended Key Usage : Server Authentication` (or other relevant authentication EKUs) This confirms the certificate can be used for server impersonation.
+    * `[+] User Enrollable Principals` showing a group like `CORP.LOCAL\Domain Users` or any group the attacker is a member of. This confirms the attacker has the necessary rights to request a certificate from this template.
+    * `Requires Manager Approval : False` and `Authorized Signatures Required : 0` confirm the absence of preventative issuance controls.
+
+3. **Exploitation**
+
+    Exploiting an ESC17 vulnerability typically involves three main steps:
+
+    1. Identifying a service that the attacker can impersonate (e.g., WSUS) and that provides some kind of advantage when impersonated (e.g., relaying or serving malicious updates).
+    2. Requesting a certificate using the vulnerable template, injecting the identity of a server to be impersonated.
+    3. Using the obtained certificate to impersonate the server and attack the actual target.
+
+    * **Step 1: Identifying a service to impersonate.**
+
+        The attacker identifies a service that they can impersonate using a certificate with the "Server Authentication" EKU. Currently publicly documented attacks focus on WSUS, which is commonly used in enterprise environments to distribute Windows updates. To identify the WSUS server, the attacker can use one of the following methods:
+        * Port scanning ([more info](https://trustedsec.com/blog/wsus-is-sus-ntlm-relay-attacks-in-plain-sight#Enumeration))
+        * Sniffing ([more info](https://trustedsec.com/blog/wsus-is-sus-ntlm-relay-attacks-in-plain-sight#Enumeration))
+        * GPO parsing (using [wsusspider.sh](https://trustedsec.com/blog/wsus-is-sus-ntlm-relay-attacks-in-plain-sight#Enumeration), [wsuks](https://blog.digitrace.de/2026/01/using-adcs-to-attack-https-enabled-wsus-clients/#step-1-identify-the-wsus-server))
+        * Local or remote registry ([more info](https://blog.digitrace.de/2026/01/using-adcs-to-attack-https-enabled-wsus-clients/#step-1-identify-the-wsus-server))
+
+        Depending on the assignment, many other potential targets are possible. Essentially, an attacker needs to identify a (TLS-protected) server or service that grants the attacker an advantage when controlled. Besides WSUS, other proprietery software management or rollout services could be interesting targets as well.
+
+    * **Step 2: Request the certificate for the server to be impersonated.**
+        The attacker (`attacker@corp.local`) uses `certipy req` to request a certificate. They specify the vulnerable template (`VulnTemplate`) and provide the FQDN of the desired victim server (e.g., `wsus.corp.local`).
+
+        The command to request the certificate:
+
+        ```bash
+        certipy req \
+            -u 'attacker@corp.local' -p 'Passw0rd!' \
+            -dc-ip '10.0.0.100' -target 'CA.CORP.LOCAL' \
+            -ca 'CORP-CA' -template 'VulnTemplate' \
+            -dns 'wsus.corp.local'
+        ```
+
+        * `-u 'attacker@corp.local' -p 'Passw0rd!'`: Credentials of the user performing the request.
+        * `-dc-ip '10.0.0.100'`: IP address of a Domain Controller for DNS lookups if needed.
+        * `-target 'CA.CORP.LOCAL' -ca 'CORP-CA'`: Specifies the target CA name and its DNS/hostname.
+        * `-template 'VulnTemplate'`: The ESC17 vulnerable template.
+        * `-dns 'wsus.corp.local'`: The FQDN of the victim server to be embedded in the certificate's SAN.
+
+        **Expected Output Snippet:**
+
+        ```text
+        Certipy v5.0.3 - by Oliver Lyak (ly4k)
+
+        [*] Requesting certificate via RPC
+        [*] Request ID is 1
+        [*] Successfully requested certificate
+        [*] Got certificate with DNS Host Name 'wsus.corp.local'
+        [*] Certificate has no object SID
+        [*] Try using -sid to set the object SID or see the wiki for more details
+        [*] Saving certificate and private key to 'wsus.pfx'
+        [*] Wrote certificate and private key to 'wsus.pfx'
+        ```
+
+        The output confirms that a certificate was issued. `Got certificate with DNS Host Name 'wsus.corp.local'` shows that the CA included the attacker-supplied identity information in the certificate. The certificate and its corresponding private key are saved to `wsus.pfx`.
+
+    * **Step 3: Impersonate the victim server.**
+      At the time of writing, two attacks against WSUS are publicly documented. See the referenced resources to learn more about how to execute these attacks in detail:
+
+       * Relay incoming WSUS update requests to LDAP to impersonate the requesting client. ([resource](https://trustedsec.com/blog/wsus-is-sus-ntlm-relay-attacks-in-plain-sight))
+       * Serve a malicious update to the requesting client achieving command execution. ([resource](https://blog.digitrace.de/2026/01/using-adcs-to-attack-https-enabled-wsus-clients/))
+
+      You may also try to attack other TLS-enabled services. The relay approach should be transferable relatively straight forward (make sure that `ntlmrelayx.py` listens on the correct port). Attacks that are more similar to the update injection need to be crafted individually. If you find something new, feel free to add it to this wiki.
+
+4. **Mitigations**
+
+    To prevent ESC17 vulnerabilities, implement the following security measures on your certificate templates:
+
+    * **Disable "Enrollee supplies subject":** For templates intended for user or computer authentication, ensure the subject name source is configured as "Build from this Active Directory information". This setting forces AD to populate the subject details based on the requester's account, preventing attacker-supplied values. Do not use "Supply in the request" unless there is an explicit, well-understood business or technical need, and strong compensating controls (like manager approval) are in place.
+    * **Restrict Enrollment Rights:** On the template's Security tab, grant "Enroll" permissions only to the specific users or security groups that legitimately require certificates from that template. Avoid granting these rights to broad, default groups like "Domain Users" or "Authenticated Users" for templates that could be abused. It might be tempting to use "Domain Computers" in the context of "Server Authentication". However, compromising a computer account might not be as hard for an attacker as you would wish for.
+    * **Implement Manager Approval:** For any template that *must* allow enrollee-supplied subjects, enable the "CA certificate manager approval" option found in the template's "Issuance Requirements" tab. This ensures that each certificate request is held in a pending state until an authorized CA manager reviews and approves it.
+    * **Use Authorized Signatures:** If a template is high-impact (e.g., allows enrollee-supplied subjects or issues powerful EKUs), consider requiring one or more authorized signatures for enrollment. This means the CSR must be co-signed by one or more users holding specific "enrollment agent" certificates.
+    * **Disable Unused Templates:** If a template is identified as vulnerable (or simply not needed for any legitimate business purpose), disable it by removing it from the list of templates issued by the CA, or by unpublishing it from Active Directory. This removes the attack vector.
