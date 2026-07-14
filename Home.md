@@ -7,6 +7,6 @@ This wiki is your guide to abusing Active Directory Certificate Services (AD CS)
 * 🔗 **[Resources](03-%E2%80%90-Resources)** - Curated list of blogs, research, and external documentation.
 * 💻 **[Installation](04-%E2%80%90-Installation)** - How to install Certipy and its dependencies.
 * ⚙️ **[Usage](05-%E2%80%90-Usage)** - Usage examples, syntax, and command-line workflows.
-* 🔥 **[Privilege Escalation](06-%E2%80%90-Privilege-Escalation)** - ESC1-ESC16 breakdown and exploitation steps.
+* 🔥 **[Privilege Escalation](06-%E2%80%90-Privilege-Escalation)** - ESC1-ESC17 breakdown and exploitation steps.
 * 🗝️ **[Post-Exploitation](07-%E2%80%90-Post‐Exploitation)** - Forging certificates, persistence, and lateral movement.
 * 📑 **[Command Reference](08-%E2%80%90-Command-Reference)** - Full list of Certipy commands and available options.
