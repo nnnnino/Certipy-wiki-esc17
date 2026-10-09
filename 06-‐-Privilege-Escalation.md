@@ -3126,6 +3126,8 @@ Misconfigurations in AD CS can allow a low-privileged user to escalate privilege
 
         Depending on the assignment, many other potential targets are possible. Essentially, an attacker needs to identify a (TLS-protected) server or service that grants the attacker an advantage when controlled. Besides WSUS, other proprietery software management or rollout services could be interesting targets as well.
 
+        WSUS was only the first service exploited publicly. Because every domain-joined machine trusts certificates issued by the enterprise CA, ESC17 is in fact a generic TLS impersonation primitive: any internal service a victim reaches over TLS can be terminated by the attacker without raising a certificate warning. Later research (see the [ESC17: Beyond WSUS](https://research.qu35t.pw/en/series/esc17-beyond-wsus/) series) generalized the attack to arbitrary HTTPS applications, LDAPS and RDP, and automated it with the [`adecrypt`](https://github.com/qu35t-code/adecrypt) tool. These additional scenarios are covered in Step 3.
+
     * **Step 2: Request the certificate for the server to be impersonated.**
         The attacker (`attacker@corp.local`) uses `certipy req` to request a certificate. They specify the vulnerable template (`VulnTemplate`) and provide the FQDN of the desired victim server (e.g., `wsus.corp.local`).
 
@@ -3163,14 +3165,102 @@ Misconfigurations in AD CS can allow a low-privileged user to escalate privilege
         The output confirms that a certificate was issued. `Got certificate with DNS Host Name 'wsus.corp.local'` shows that the CA included the attacker-supplied identity information in the certificate. The certificate and its corresponding private key are saved to `wsus.pfx`.
 
     * **Step 3: Impersonate the victim server.**
-      At the time of writing, two attacks against WSUS are publicly documented. See the referenced resources to learn more about how to execute these attacks in detail:
 
-       * Relay incoming WSUS update requests to LDAP to impersonate the requesting client. ([resource](https://trustedsec.com/blog/wsus-is-sus-ntlm-relay-attacks-in-plain-sight))
-       * Serve a malicious update to the requesting client achieving command execution. ([resource](https://blog.digitrace.de/2026/01/using-adcs-to-attack-https-enabled-wsus-clients/))
+        Once the certificate is issued, the attacker uses it to terminate the victim's TLS session. Every scenario below needs two things: an **on-path (MitM) position** (ARP spoofing, IPv6 router advertisements / `mitm6`, DNS poisoning, etc.), and a **trusted certificate whose SAN matches the exact FQDN** the victim connects to, so no warning is raised. A single wildcard (`*.corp.local`) covers the whole domain in one issuance; alternatively the `https` and `rdp` modes can forge certificates on the fly per host (`--ca-*` options). The full mechanism, outputs and limitations of each case are detailed in the [ESC17: Beyond WSUS](https://research.qu35t.pw/en/series/esc17-beyond-wsus/) series.
 
-      You may also try to attack other TLS-enabled services. The relay approach should be transferable relatively straight forward (make sure that `ntlmrelayx.py` listens on the correct port). Attacks that are more similar to the update injection need to be crafted individually. If you find something new, feel free to add it to this wiki.
+        What the attacker gains afterwards depends on the targeted service. The documented scenarios follow; if you find a new one, feel free to add it to this wiki.
+
+        **Scenario A: WSUS (code execution / relay)**
+
+        This is the original ESC17 use case. The attacker impersonates the internal WSUS server used to distribute Windows updates. At the time of writing, two attacks against WSUS are publicly documented:
+
+        * Relay incoming WSUS update requests to LDAP to impersonate the requesting client. ([resource](https://trustedsec.com/blog/wsus-is-sus-ntlm-relay-attacks-in-plain-sight))
+        * Serve a malicious update to the requesting client, achieving command execution. ([resource](https://blog.digitrace.de/2026/01/using-adcs-to-attack-https-enabled-wsus-clients/))
+
+        See the referenced resources for the detailed execution. Note that WSUS clients poll on a schedule, so triggering or waiting for a check-in (up to a day) may be required.
+
+        **Scenario B: Internal HTTPS (credential capture / NTLM relay)**
+
+        Any internal web application, intranet or admin interface reached over HTTPS can be terminated with an ESC17 certificate. `adecrypt` selects internal traffic by SNI and passes external names through untouched. Request a certificate for the target (or a `*.corp.local` wildcard) and capture credentials in cleartext (HTTP Basic, login forms, Bearer/JWT tokens, API keys, session cookies):
+
+        ```bash
+        certipy req \
+            -u 'attacker@corp.local' -p 'Passw0rd!' \
+            -dc-ip '10.0.0.100' -target 'CA.CORP.LOCAL' \
+            -ca 'CORP-CA' -template 'VulnTemplate' \
+            -dns 'app.corp.local'
+        ```
+
+        ```bash
+        sudo adecrypt https \
+            --interface eth0 --gateway '10.0.0.1' \
+            --targets '10.0.0.12' --only-ips '10.0.0.11' \
+            --pfx 'app.pfx'
+        ```
+
+        For integrated Windows authentication, `adecrypt` downgrades the `Negotiate` challenge to NTLM (Kerberos cannot be relayed) and shuttles it to the DC's LDAPS itself, dropping the session into the same built-in LDAP shell as Scenario C (`--ldap-shell`):
+
+        ```bash
+        sudo adecrypt https \
+            --interface eth0 --gateway '10.0.0.1' \
+            --targets '10.0.0.12' --only-ips '10.0.0.11' \
+            --pfx 'app.pfx' \
+            --ldap-shell --ldap-dc '10.0.0.100'
+        ```
+
+        The NTLM exchange can instead be sent to an external `ntlmrelayx.py` with `--relay-to HOST:PORT`. Relaying to LDAP (389) is blocked by signing; LDAPS (636) only by channel binding. **Protected Users** cannot use NTLM, so this path does not apply to them (the Scenario C hijack does).
+
+        **Scenario C: LDAPS (cleartext binds / session hijacking)**
+
+        Integrations that authenticate to a Domain Controller over LDAPS (appliances, VPNs, printers, NAS, IAM connectors, service accounts) can be intercepted. Active Directory does not seal SASL over a TLS connection ([MS-ADTS]), so once the attacker holds the TLS, the post-bind LDAP traffic is in the clear whatever the bind type. StartTLS on port 389 is equally affected (`adecrypt` intercepts both, `--ports 636,389` by default).
+
+        Request a certificate for the Domain Controller and run `adecrypt` on-path between the client and the DC:
+
+        ```bash
+        certipy req \
+            -u 'attacker@corp.local' -p 'Passw0rd!' \
+            -dc-ip '10.0.0.100' -target 'CA.CORP.LOCAL' \
+            -ca 'CORP-CA' -template 'VulnTemplate' \
+            -dns 'dc01.corp.local'
+        ```
+
+        ```bash
+        sudo adecrypt ldaps \
+            --interface eth0 --gateway '10.0.0.1' \
+            --targets '10.0.0.11' \
+            --dc '10.0.0.100:dc01.pfx' --ports 636 \
+            --ldap-shell
+        ```
+
+        Depending on the bind type:
+
+        * **Simple bind:** the DN and password are captured in cleartext (channel binding does not protect a simple bind).
+        * **SASL (NTLM or Kerberos):** the bind is passed to the DC verbatim (MIC untouched), so it succeeds, then `adecrypt` rides the unsealed session as the victim (`--ldap-shell`: `grant_dcsync`, `set_rbcd`, `set_shadow_creds`...). Because nothing is relayed, this works on Kerberos as on NTLM, and therefore even against **Protected Users** (administrators included). The shell is multi-session (like `ntlmrelayx -i`, with a `-socks`-style pool: `sessions` / `use <id>`).
+        * **`--spnego-downgrade`:** forces a Kerberos client down to NTLM to capture a NetNTLMv2 hash for offline cracking (`hashcat -m 5600`): a durable credential instead of a live session.
+
+        This hijack requires LDAP channel binding disabled on the DC (`LdapEnforceChannelBinding = 0`); setting it to `2` (Always) defeats it for both NTLM and Kerberos. LDAP signing (`LDAPServerIntegrity = 2`) is a separate control, against the plaintext relay to LDAP on port 389; enforce both.
+
+        **Scenario D: RDP (cleartext password capture)**
+
+        An ESC17 certificate for the RDP server's FQDN removes the `mstsc` certificate warning. The classic NLA downgrade fails on modern clients (error `0x609`) and NLA-enforcing servers, so the reliable path is **CredSSP termination** (`--credssp-terminate`): `adecrypt` recovers the NTLM session key from the DC through a Netlogon pass-through with a controlled machine account (trivial when `MachineAccountQuota > 0`), forges a valid `pubKeyAuth`, and the client delegates its cleartext password even with NLA enforced.
+
+        `--credssp-terminate` needs a static certificate (`--pfx` / `--cert`), so on-the-fly generation does not apply to this path. Request a per-host certificate (`-dns 'wk01.corp.local'` → `wk01.pfx`) for a single target, or a wildcard (`*.corp.local`) to cover several servers at once: pass it with `--pfx` and give `--target` a list, CIDR or range instead of one IP (each connection's real destination is recovered transparently). For the non-terminate paths, `adecrypt` can also forge certificates on the fly per host (FQDN from PTR or forced with `--rdp-map IP:FQDN`).
+
+        ```bash
+        sudo adecrypt rdp \
+            --interface eth0 --gateway '10.0.0.1' \
+            --targets '10.0.0.12' --target '10.0.0.11' \
+            --pfx 'wk01.pfx' \
+            --credssp-terminate \
+            --machine-account 'ATTACKER$' --machine-pass 'Passw0rd!' \
+            --dc-ip '10.0.0.100' --dc-name 'DC01' --domain 'corp.local'
+        ```
+
+        The same command handles both IP connections (direct NTLM) and hostname connections (`adecrypt` brings the Kerberos negotiation back to NTLM via SPNEGO). It captures the delegated credentials (`TSPasswordCreds`) in cleartext, and is defeated by disabling/restricting NTLM, by **Protected Users**, Restricted Admin or Remote Credential Guard, and by smart-card authentication, since none of these delegate a reusable password.
 
 4. **Mitigations**
+
+    The root cause is at the template level, so fix it there first. Do not rely on the EKU value alone to decide a template is safe: "Server Authentication" is just as abusable as a client-authentication EKU when the subject is enrollee-supplied.
 
     To prevent ESC17 vulnerabilities, implement the following security measures on your certificate templates:
 
@@ -3179,3 +3269,11 @@ Misconfigurations in AD CS can allow a low-privileged user to escalate privilege
     * **Implement Manager Approval:** For any template that *must* allow enrollee-supplied subjects, enable the "CA certificate manager approval" option found in the template's "Issuance Requirements" tab. This ensures that each certificate request is held in a pending state until an authorized CA manager reviews and approves it.
     * **Use Authorized Signatures:** If a template is high-impact (e.g., allows enrollee-supplied subjects or issues powerful EKUs), consider requiring one or more authorized signatures for enrollment. This means the CSR must be co-signed by one or more users holding specific "enrollment agent" certificates.
     * **Disable Unused Templates:** If a template is identified as vulnerable (or simply not needed for any legitimate business purpose), disable it by removing it from the list of templates issued by the CA, or by unpublishing it from Active Directory. This removes the attack vector.
+
+    Because ESC17 ultimately abuses TLS interception, defense-in-depth measures on the targeted services also break the exploitation chain, even where a vulnerable template still exists:
+
+    * **Enforce LDAP channel binding and signing:** Set `LdapEnforceChannelBinding = 2` (Always) on Domain Controllers. This ties authentication to the DC's real certificate, so the ESC17 certificate fails, defeating the LDAPS session hijack (Scenario C) including against Protected Users. Keep `LDAPServerIntegrity = 2` (signing required) as well, as each setting blocks a different attack.
+    * **Enforce NLA and harden RDP:** Enforce NLA on both client and server. For administrative connections, use Remote Credential Guard or Restricted Admin, and place sensitive accounts in **Protected Users** so no reusable password is delegated (Scenario D). Smart-card authentication has the same effect.
+    * **Restrict NTLM:** Disabling or restricting NTLM across the domain breaks the relay and credential-capture paths that rely on it (Scenarios B and D).
+    * **Pin certificates where feasible:** Clients that pin a specific certificate or key are not affected by ESC17, since the forged certificate will not match. This is the most direct control for high-value internal services.
+    * **Monitor and segment:** Watch for issuance of Server Authentication certificates with arbitrary or unexpected SANs, and for unusual TLS terminations or binds from unexpected hosts. Network segmentation reduces the man-in-the-middle positions an attacker can obtain in the first place.
